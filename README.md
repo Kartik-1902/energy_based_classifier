@@ -45,7 +45,7 @@ Inference rule:
 ## Setup
 
 ```bash
-cd energy_classifier
+cd energy_based_classifier
 python -m venv .venv
 . .venv/Scripts/activate
 pip install -r requirements.txt
