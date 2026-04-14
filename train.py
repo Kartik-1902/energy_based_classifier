@@ -12,11 +12,11 @@ import torch
 import torch.nn as nn
 from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from tqdm import tqdm
 from torchvision import datasets, transforms
 
-from config import DEFAULT_CONFIG, TrainConfig, ensure_dirs
+from config import DEFAULT_CONFIG, TrainConfig, class_names_from_indices, parse_class_indices, ensure_dirs
 from model import build_model
 from profile_energy import compute_and_save_profiles
 
@@ -27,6 +27,27 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+class CIFARClassSubset(Dataset):
+    """Filter CIFAR dataset to selected classes and remap labels to [0, num_id_classes)."""
+
+    def __init__(self, dataset: datasets.CIFAR10, selected_classes: tuple[int, ...]):
+        self.dataset = dataset
+        self.selected_classes = tuple(int(c) for c in selected_classes)
+        self.class_to_local = {c: i for i, c in enumerate(self.selected_classes)}
+        self.indices = [
+            idx
+            for idx, label in enumerate(dataset.targets)
+            if int(label) in self.class_to_local
+        ]
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int):
+        image, label = self.dataset[self.indices[index]]
+        return image, self.class_to_local[int(label)]
 
 
 def build_dataloaders(cfg: TrainConfig) -> tuple[DataLoader, DataLoader]:
@@ -47,17 +68,21 @@ def build_dataloaders(cfg: TrainConfig) -> tuple[DataLoader, DataLoader]:
     )
 
     full_train = datasets.CIFAR10(root=cfg.data_root, train=True, download=True, transform=train_tfm)
+    full_train_eval = datasets.CIFAR10(root=cfg.data_root, train=True, download=False, transform=eval_tfm)
 
-    val_size = int(len(full_train) * cfg.val_split)
-    train_size = len(full_train) - val_size
-    train_subset, val_subset = random_split(
-        full_train,
+    filtered_train = CIFARClassSubset(full_train, cfg.id_classes)
+    filtered_eval = CIFARClassSubset(full_train_eval, cfg.id_classes)
+
+    val_size = int(len(filtered_train) * cfg.val_split)
+    train_size = len(filtered_train) - val_size
+    train_subset_idx, val_subset_idx = random_split(
+        range(len(filtered_train)),
         lengths=[train_size, val_size],
         generator=torch.Generator().manual_seed(cfg.seed),
     )
 
-    # Validation should not use random augmentation.
-    val_subset.dataset = datasets.CIFAR10(root=cfg.data_root, train=True, download=False, transform=eval_tfm)
+    train_subset = Subset(filtered_train, list(train_subset_idx))
+    val_subset = Subset(filtered_eval, list(val_subset_idx))
 
     train_loader = DataLoader(
         train_subset,
@@ -174,6 +199,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_CONFIG.weight_decay)
     parser.add_argument("--temperature", type=float, default=DEFAULT_CONFIG.temperature)
     parser.add_argument("--tau", type=float, default=DEFAULT_CONFIG.tau)
+    parser.add_argument(
+        "--id-classes",
+        type=str,
+        default=",".join(str(i) for i in DEFAULT_CONFIG.id_classes),
+        help="Comma-separated CIFAR-10 class indices used as in-distribution classes",
+    )
+    parser.add_argument(
+        "--ood-classes",
+        type=str,
+        default=",".join(str(i) for i in DEFAULT_CONFIG.ood_classes),
+        help="Comma-separated CIFAR-10 class indices held out for OOD evaluation",
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_CONFIG.seed)
     parser.add_argument("--val-split", type=float, default=DEFAULT_CONFIG.val_split)
     parser.add_argument("--save-every", type=int, default=10, help="Save periodic checkpoints every N epochs")
@@ -185,11 +222,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Entry point for model training and post-training energy profiling."""
     args = parse_args()
+    id_classes = parse_class_indices(args.id_classes)
+    ood_classes = parse_class_indices(args.ood_classes)
     cfg = TrainConfig(
         data_root=args.data_root,
         checkpoints_dir=args.checkpoints_dir,
         results_dir=args.results_dir,
         model_name=args.model_name,
+        id_classes=id_classes,
+        ood_classes=ood_classes,
+        num_classes=len(id_classes),
         epochs=args.epochs,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -204,6 +246,9 @@ def main() -> None:
 
     ensure_dirs(cfg)
     set_seed(cfg.seed)
+
+    print(f"ID classes: {cfg.id_classes} -> {class_names_from_indices(cfg.id_classes)}")
+    print(f"OOD classes: {cfg.ood_classes} -> {class_names_from_indices(cfg.ood_classes)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -258,6 +303,10 @@ def main() -> None:
         state = {
             "epoch": epoch,
             "model_name": cfg.model_name,
+            "num_classes": cfg.num_classes,
+            "id_classes": list(cfg.id_classes),
+            "ood_classes": list(cfg.ood_classes),
+            "id_class_names": class_names_from_indices(cfg.id_classes),
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
@@ -312,6 +361,7 @@ def main() -> None:
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         num_classes=cfg.num_classes,
+        id_classes=cfg.id_classes,
         plot_path=plot_path,
     )
 

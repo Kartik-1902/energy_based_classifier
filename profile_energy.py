@@ -7,16 +7,43 @@ import pickle
 from pathlib import Path
 
 import torch
+from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 
-from config import CIFAR10_CLASSES, DEFAULT_CONFIG
+from config import DEFAULT_CONFIG, class_names_from_indices, parse_class_indices
 from energy import class_energy, compute_energy_profiles
 from model import build_model
 from utils import plot_energy_distributions
 
 
-def build_profile_loader(data_root: str, batch_size: int, num_workers: int) -> torch.utils.data.DataLoader:
-    """Return dataloader over all CIFAR-10 training samples (no augmentation)."""
+class CIFARClassSubset(Dataset):
+    """Filter CIFAR dataset to selected classes and remap labels to [0, num_id_classes)."""
+
+    def __init__(self, dataset: datasets.CIFAR10, selected_classes: tuple[int, ...]):
+        self.dataset = dataset
+        self.selected_classes = tuple(int(c) for c in selected_classes)
+        self.class_to_local = {c: i for i, c in enumerate(self.selected_classes)}
+        self.indices = [
+            idx
+            for idx, label in enumerate(dataset.targets)
+            if int(label) in self.class_to_local
+        ]
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int):
+        image, label = self.dataset[self.indices[index]]
+        return image, self.class_to_local[int(label)]
+
+
+def build_profile_loader(
+    data_root: str,
+    batch_size: int,
+    num_workers: int,
+    id_classes: tuple[int, ...],
+) -> torch.utils.data.DataLoader:
+    """Return dataloader over ID CIFAR-10 training samples (no augmentation)."""
     tfm = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -24,8 +51,9 @@ def build_profile_loader(data_root: str, batch_size: int, num_workers: int) -> t
         ]
     )
     dataset = datasets.CIFAR10(root=data_root, train=True, download=True, transform=tfm)
+    filtered_dataset = CIFARClassSubset(dataset, id_classes)
     return torch.utils.data.DataLoader(
-        dataset,
+        filtered_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -41,6 +69,7 @@ def compute_and_save_profiles(
     batch_size: int = DEFAULT_CONFIG.batch_size,
     num_workers: int = DEFAULT_CONFIG.num_workers,
     num_classes: int = DEFAULT_CONFIG.num_classes,
+    id_classes: tuple[int, ...] = DEFAULT_CONFIG.id_classes,
     plot_path: str | None = None,
 ) -> dict:
     """Load model checkpoint, compute per-class energy profiles, and save to disk."""
@@ -48,16 +77,32 @@ def compute_and_save_profiles(
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     model_name = checkpoint.get("model_name", model_name)
+    num_classes = int(checkpoint.get("num_classes", num_classes))
+    id_classes = tuple(checkpoint.get("id_classes", list(id_classes)))
+    class_names = checkpoint.get("id_class_names", class_names_from_indices(id_classes))
+
     model = build_model(model_name=model_name, num_classes=num_classes).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    loader = build_profile_loader(data_root=data_root, batch_size=batch_size, num_workers=num_workers)
+    loader = build_profile_loader(
+        data_root=data_root,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        id_classes=id_classes,
+    )
     profiles = compute_energy_profiles(model=model, dataloader=loader, num_classes=num_classes, device=device)
+
+    profiles_payload = {
+        "profiles": profiles,
+        "num_classes": num_classes,
+        "id_classes": list(id_classes),
+        "id_class_names": list(class_names),
+    }
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as f:
-        pickle.dump(profiles, f)
+        pickle.dump(profiles_payload, f)
 
     print("\nPer-class energy profile summary")
     print("Class         |      mu |   sigma |     min |     max | count")
@@ -65,7 +110,7 @@ def compute_and_save_profiles(
     for k in range(num_classes):
         p = profiles[k]
         print(
-            f"{CIFAR10_CLASSES[k]:<13}| {p['mu']:>7.4f} | {p['sigma']:>7.4f} | "
+            f"{class_names[k]:<13}| {p['mu']:>7.4f} | {p['sigma']:>7.4f} | "
             f"{p['min']:>7.4f} | {p['max']:>7.4f} | {p['count']:>5d}"
         )
 
@@ -81,7 +126,7 @@ def compute_and_save_profiles(
                     if mask.any():
                         per_class_energies[k].extend(class_energy(logits[mask], k).cpu().numpy().tolist())
 
-        plot_energy_distributions(per_class_energies, CIFAR10_CLASSES, plot_path)
+        plot_energy_distributions(per_class_energies, class_names, plot_path)
         print(f"Saved energy distribution plot to {plot_path}")
 
     print(f"Saved energy profiles to {output_path}\n")
@@ -97,6 +142,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=str, default=DEFAULT_CONFIG.data_root)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_CONFIG.batch_size)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_CONFIG.num_workers)
+    parser.add_argument(
+        "--id-classes",
+        type=str,
+        default=",".join(str(i) for i in DEFAULT_CONFIG.id_classes),
+        help="Comma-separated CIFAR-10 class indices used as in-distribution classes",
+    )
     parser.add_argument("--plot-path", type=str, default="./results/energy_distributions.png")
     return parser.parse_args()
 
@@ -111,6 +162,7 @@ def main() -> None:
         data_root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        id_classes=parse_class_indices(args.id_classes),
         plot_path=args.plot_path,
     )
 

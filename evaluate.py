@@ -12,13 +12,34 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import minimize_scalar
 from sklearn.metrics import roc_auc_score, roc_curve
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import datasets, transforms
 
-from config import CIFAR10_CLASSES, DEFAULT_CONFIG
+from config import CIFAR10_CLASSES, DEFAULT_CONFIG, class_names_from_indices, parse_class_indices
 from energy import energy_predict, marginal_energy
 from model import build_model
 from utils import compute_ece, plot_calibration, plot_ood_separation
+
+
+class CIFARClassSubset(Dataset):
+    """Filter CIFAR dataset to selected classes and remap labels to [0, num_selected_classes)."""
+
+    def __init__(self, dataset: datasets.CIFAR10, selected_classes: tuple[int, ...]):
+        self.dataset = dataset
+        self.selected_classes = tuple(int(c) for c in selected_classes)
+        self.class_to_local = {c: i for i, c in enumerate(self.selected_classes)}
+        self.indices = [
+            idx
+            for idx, label in enumerate(dataset.targets)
+            if int(label) in self.class_to_local
+        ]
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int):
+        image, label = self.dataset[self.indices[index]]
+        return image, self.class_to_local[int(label)]
 
 
 def build_eval_transform() -> transforms.Compose:
@@ -41,15 +62,32 @@ def load_model_and_profiles(
     """Load trained model checkpoint and per-class energy profile dictionary."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model_name = checkpoint.get("model_name", model_name)
+    id_classes = tuple(checkpoint.get("id_classes", list(DEFAULT_CONFIG.id_classes)))
+    num_classes = int(checkpoint.get("num_classes", num_classes))
+    id_class_names = checkpoint.get("id_class_names", class_names_from_indices(id_classes))
 
     model = build_model(model_name=model_name, num_classes=num_classes).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     with open(profiles_path, "rb") as f:
-        profiles = pickle.load(f)
+        profiles_blob = pickle.load(f)
 
-    return model, profiles
+    profiles = profiles_blob
+    if isinstance(profiles_blob, dict) and "profiles" in profiles_blob:
+        profiles = profiles_blob["profiles"]
+        id_classes = tuple(profiles_blob.get("id_classes", list(id_classes)))
+        id_class_names = profiles_blob.get("id_class_names", id_class_names)
+        num_classes = int(profiles_blob.get("num_classes", num_classes))
+
+    metadata = {
+        "id_classes": id_classes,
+        "id_class_names": list(id_class_names),
+        "num_classes": num_classes,
+        "ood_classes": tuple(checkpoint.get("ood_classes", list(DEFAULT_CONFIG.ood_classes))),
+    }
+
+    return model, profiles, metadata
 
 
 def compute_fpr_at_95_tpr(y_true: np.ndarray, scores: np.ndarray) -> float:
@@ -101,6 +139,7 @@ def evaluate_id_metrics(
     profiles: Dict[int, Dict[str, float]],
     tau: float,
     temperature: float,
+    class_names: list[str],
 ) -> Dict[str, float | np.ndarray]:
     """Evaluate softmax and energy classifiers on in-distribution CIFAR-10."""
     logits = torch.from_numpy(logits_np)
@@ -132,7 +171,7 @@ def evaluate_id_metrics(
     )
 
     per_class_acc = {}
-    for class_idx, class_name in enumerate(CIFAR10_CLASSES):
+    for class_idx, class_name in enumerate(class_names):
         mask = labels_np == class_idx
         if np.any(mask):
             per_class_acc[class_name] = float((energy_preds.numpy()[mask] == labels_np[mask]).mean())
@@ -200,7 +239,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=DEFAULT_CONFIG.num_workers)
     parser.add_argument("--tau", type=float, default=DEFAULT_CONFIG.tau)
     parser.add_argument("--temperature", type=float, default=DEFAULT_CONFIG.temperature)
-    parser.add_argument("--ood-dataset", type=str, default="cifar100", choices=["cifar100", "svhn"])
+    parser.add_argument(
+        "--id-classes",
+        type=str,
+        default=",".join(str(i) for i in DEFAULT_CONFIG.id_classes),
+        help="Comma-separated CIFAR-10 class indices used as in-distribution classes",
+    )
+    parser.add_argument(
+        "--ood-classes",
+        type=str,
+        default=",".join(str(i) for i in DEFAULT_CONFIG.ood_classes),
+        help="Comma-separated CIFAR-10 class indices held out for OOD evaluation",
+    )
+    parser.add_argument(
+        "--ood-dataset",
+        type=str,
+        default="heldout-cifar10",
+        choices=["heldout-cifar10", "cifar100", "svhn"],
+    )
     parser.add_argument("--calibrate-temperature", action="store_true")
     parser.add_argument("--results-dir", type=str, default=DEFAULT_CONFIG.results_dir)
     return parser.parse_args()
@@ -213,19 +269,35 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     Path(args.results_dir).mkdir(parents=True, exist_ok=True)
 
-    model, profiles = load_model_and_profiles(
+    cli_id_classes = parse_class_indices(args.id_classes)
+    cli_ood_classes = parse_class_indices(args.ood_classes)
+
+    model, profiles, metadata = load_model_and_profiles(
         checkpoint_path=args.checkpoint,
         profiles_path=args.profiles,
         model_name=args.model_name,
-        num_classes=len(CIFAR10_CLASSES),
+        num_classes=len(cli_id_classes),
         device=device,
     )
 
+    id_classes = tuple(metadata.get("id_classes", list(cli_id_classes)))
+    ood_classes = tuple(metadata.get("ood_classes", list(cli_ood_classes)))
+    id_class_names = metadata.get("id_class_names", class_names_from_indices(id_classes))
+
+    if set(id_classes) & set(ood_classes):
+        raise ValueError("ID and OOD classes must be disjoint.")
+
+    print(f"ID classes: {id_classes} -> {id_class_names}")
+    print(f"OOD classes: {ood_classes} -> {class_names_from_indices(ood_classes)}")
+
     tfm = build_eval_transform()
     cifar10_test = datasets.CIFAR10(root=args.data_root, train=False, download=True, transform=tfm)
-    id_loader = DataLoader(cifar10_test, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    id_dataset = CIFARClassSubset(cifar10_test, id_classes)
+    id_loader = DataLoader(id_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    if args.ood_dataset == "cifar100":
+    if args.ood_dataset == "heldout-cifar10":
+        ood_dataset = CIFARClassSubset(cifar10_test, ood_classes)
+    elif args.ood_dataset == "cifar100":
         ood_dataset = datasets.CIFAR100(root=args.data_root, train=False, download=True, transform=tfm)
     else:
         ood_dataset = datasets.SVHN(root=args.data_root, split="test", download=True, transform=tfm)
@@ -235,10 +307,10 @@ def main() -> None:
     temperature = args.temperature
 
     if args.calibrate_temperature:
-        calib_size = int(0.2 * len(cifar10_test))
-        eval_size = len(cifar10_test) - calib_size
+        calib_size = int(0.2 * len(id_dataset))
+        eval_size = len(id_dataset) - calib_size
         calib_subset, eval_subset = random_split(
-            cifar10_test,
+            id_dataset,
             lengths=[calib_size, eval_size],
             generator=torch.Generator().manual_seed(42),
         )
@@ -261,6 +333,7 @@ def main() -> None:
         profiles=profiles,
         tau=args.tau,
         temperature=temperature,
+        class_names=id_class_names,
     )
 
     ood_metrics = evaluate_ood(

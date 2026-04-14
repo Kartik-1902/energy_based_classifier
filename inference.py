@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-from config import CIFAR10_CLASSES, DEFAULT_CONFIG
+from config import DEFAULT_CONFIG, class_names_from_indices
 from energy import energy_predict
 from model import build_model
 
@@ -38,23 +38,33 @@ def load_artifacts(
     """Load trained model checkpoint and serialized energy profiles."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model_name = checkpoint.get("model_name", model_name)
+    num_classes = int(checkpoint.get("num_classes", num_classes))
+    id_classes = tuple(checkpoint.get("id_classes", list(DEFAULT_CONFIG.id_classes)))
+    class_names = checkpoint.get("id_class_names", class_names_from_indices(id_classes))
+
     model = build_model(model_name=model_name, num_classes=num_classes).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     with open(profiles_path, "rb") as f:
-        profiles = pickle.load(f)
+        profiles_blob = pickle.load(f)
 
-    return model, profiles
+    profiles = profiles_blob
+    if isinstance(profiles_blob, dict) and "profiles" in profiles_blob:
+        profiles = profiles_blob["profiles"]
+        id_classes = tuple(profiles_blob.get("id_classes", list(id_classes)))
+        class_names = profiles_blob.get("id_class_names", class_names)
+
+    return model, profiles, list(class_names)
 
 
-def plot_z_scores(z_scores: torch.Tensor, output_path: str) -> None:
+def plot_z_scores(z_scores: torch.Tensor, class_names: list[str], output_path: str) -> None:
     """Visualize per-class z-scores for a single input image."""
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     values = z_scores.detach().cpu().numpy().reshape(-1)
 
     plt.figure(figsize=(10, 5))
-    plt.bar(CIFAR10_CLASSES, values)
+    plt.bar(class_names, values)
     plt.xticks(rotation=30, ha="right")
     plt.ylabel("Energy z-score")
     plt.title("Per-class Energy Z-scores")
@@ -82,11 +92,11 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model, profiles = load_artifacts(
+    model, profiles, class_names = load_artifacts(
         checkpoint_path=args.checkpoint,
         profiles_path=args.profiles,
         model_name=args.model_name,
-        num_classes=len(CIFAR10_CLASSES),
+        num_classes=DEFAULT_CONFIG.num_classes,
         device=device,
     )
 
@@ -104,18 +114,18 @@ def main() -> None:
     confidence = float(max(0.0, min(1.0, 1.0 - (min_z / max(args.tau, 1e-6)))))
 
     print(f"Image: {args.image}")
-    print(f"Softmax baseline prediction: {CIFAR10_CLASSES[softmax_pred.item()]} (p={softmax_conf.item():.4f})")
-    print(f"Energy prediction: {CIFAR10_CLASSES[pred.item()]}")
+    print(f"Softmax baseline prediction: {class_names[softmax_pred.item()]} (p={softmax_conf.item():.4f})")
+    print(f"Energy prediction: {class_names[pred.item()]}")
     print(f"Min energy z-score: {min_z:.4f}")
     print(f"Confidence (1 - min_z/tau): {confidence:.4f}")
     print(f"OOD rejected: {bool(is_ood.item())}")
 
     print("\nPer-class z-scores:")
-    for k, cls_name in enumerate(CIFAR10_CLASSES):
+    for k, cls_name in enumerate(class_names):
         print(f"  {cls_name:<11} -> {z_scores[0, k].item():.4f}")
 
     if args.plot:
-        plot_z_scores(z_scores[0], args.plot_path)
+        plot_z_scores(z_scores[0], class_names, args.plot_path)
         print(f"Saved z-score plot to {args.plot_path}")
 
 
