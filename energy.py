@@ -22,6 +22,7 @@ def compute_energy_profiles(
     model: torch.nn.Module,
     dataloader: torch.utils.data.DataLoader,
     num_classes: int = 10,
+    temperature: float = 1.0,
     device: torch.device | None = None,
 ) -> Dict[int, Dict[str, float]]:
     """Compute per-class mean/std profile for class-conditional energies over a dataset."""
@@ -35,7 +36,7 @@ def compute_energy_profiles(
         for images, labels in dataloader:
             images = images.to(device)
             labels = labels.to(device)
-            logits = model(images)
+            logits = model(images) / max(temperature, 1e-6)
 
             for k in range(num_classes):
                 mask = labels == k
@@ -64,13 +65,15 @@ def energy_predict(
     logits: torch.Tensor,
     profiles: Dict[int, Dict[str, float]],
     tau: float = 3.0,
+    temperature: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Predict class and OOD flag using z-score distance to per-class energy profiles."""
     num_classes = len(profiles)
 
     z_scores = []
+    scaled_logits = logits / max(temperature, 1e-6)
     for k in range(num_classes):
-        e_k = class_energy(logits, k)
+        e_k = class_energy(scaled_logits, k)
         mu_k = profiles[k]["mu"]
         sigma_k = max(profiles[k]["sigma"], 1e-6)
         z_k = torch.abs((e_k - mu_k) / sigma_k)

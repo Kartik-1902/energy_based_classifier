@@ -110,6 +110,8 @@ def run_epoch(
     epoch_idx: int,
     total_epochs: int,
     use_progress_bar: bool,
+    entropy_lambda: float,
+    temperature: float,
 ) -> tuple[float, float]:
     """Run one train or evaluation epoch and return loss/accuracy."""
     is_train = optimizer is not None
@@ -134,6 +136,12 @@ def run_epoch(
 
         logits = model(images)
         loss = criterion(logits, labels)
+
+        if is_train and entropy_lambda > 0.0:
+            probs = torch.softmax(logits / max(temperature, 1e-6), dim=1)
+            entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=1).mean()
+            # Minimize CE + lambda * (-entropy) to discourage overconfident peaky outputs.
+            loss = loss + entropy_lambda * (-entropy)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -197,6 +205,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=DEFAULT_CONFIG.lr)
     parser.add_argument("--momentum", type=float, default=DEFAULT_CONFIG.momentum)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_CONFIG.weight_decay)
+    parser.add_argument("--label-smoothing", type=float, default=DEFAULT_CONFIG.label_smoothing)
+    parser.add_argument("--entropy-lambda", type=float, default=DEFAULT_CONFIG.entropy_lambda)
     parser.add_argument("--temperature", type=float, default=DEFAULT_CONFIG.temperature)
     parser.add_argument("--tau", type=float, default=DEFAULT_CONFIG.tau)
     parser.add_argument(
@@ -238,6 +248,8 @@ def main() -> None:
         lr=args.lr,
         momentum=args.momentum,
         weight_decay=args.weight_decay,
+        label_smoothing=args.label_smoothing,
+        entropy_lambda=args.entropy_lambda,
         temperature=args.temperature,
         tau=args.tau,
         seed=args.seed,
@@ -256,7 +268,7 @@ def main() -> None:
     train_loader, val_loader = build_dataloaders(cfg)
     model = build_model(model_name=cfg.model_name, num_classes=cfg.num_classes).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
     optimizer = SGD(model.parameters(), lr=cfg.lr, momentum=cfg.momentum, weight_decay=cfg.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs)
 
@@ -286,6 +298,8 @@ def main() -> None:
             epoch_idx=epoch,
             total_epochs=cfg.epochs,
             use_progress_bar=not args.no_progress_bar,
+            entropy_lambda=cfg.entropy_lambda,
+            temperature=cfg.temperature,
         )
         val_loss, val_acc = run_epoch(
             model,
@@ -296,6 +310,8 @@ def main() -> None:
             epoch_idx=epoch,
             total_epochs=cfg.epochs,
             use_progress_bar=not args.no_progress_bar,
+            entropy_lambda=0.0,
+            temperature=cfg.temperature,
         )
         scheduler.step()
         current_lr = float(optimizer.param_groups[0]["lr"])
@@ -312,6 +328,8 @@ def main() -> None:
             "scheduler_state_dict": scheduler.state_dict(),
             "best_val_acc": best_val_acc,
             "temperature": cfg.temperature,
+            "label_smoothing": cfg.label_smoothing,
+            "entropy_lambda": cfg.entropy_lambda,
             "tau": cfg.tau,
             "args": vars(args),
         }
@@ -362,6 +380,7 @@ def main() -> None:
         num_workers=cfg.num_workers,
         num_classes=cfg.num_classes,
         id_classes=cfg.id_classes,
+        temperature=cfg.temperature,
         plot_path=plot_path,
     )
 

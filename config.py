@@ -67,9 +67,12 @@ class TrainConfig:
     lr: float = 0.1
     momentum: float = 0.9
     weight_decay: float = 5e-4
+    label_smoothing: float = 0.1
+    entropy_lambda: float = 0.01
 
     temperature: float = 1.0
     tau: float = 3.0
+    odin_epsilon: float = 0.002
 
     seed: int = 42
     val_split: float = 0.1

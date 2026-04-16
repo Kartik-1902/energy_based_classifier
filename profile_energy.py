@@ -70,6 +70,7 @@ def compute_and_save_profiles(
     num_workers: int = DEFAULT_CONFIG.num_workers,
     num_classes: int = DEFAULT_CONFIG.num_classes,
     id_classes: tuple[int, ...] = DEFAULT_CONFIG.id_classes,
+    temperature: float = DEFAULT_CONFIG.temperature,
     plot_path: str | None = None,
 ) -> dict:
     """Load model checkpoint, compute per-class energy profiles, and save to disk."""
@@ -79,6 +80,7 @@ def compute_and_save_profiles(
     model_name = checkpoint.get("model_name", model_name)
     num_classes = int(checkpoint.get("num_classes", num_classes))
     id_classes = tuple(checkpoint.get("id_classes", list(id_classes)))
+    temperature = float(checkpoint.get("temperature", temperature))
     class_names = checkpoint.get("id_class_names", class_names_from_indices(id_classes))
 
     model = build_model(model_name=model_name, num_classes=num_classes).to(device)
@@ -91,13 +93,20 @@ def compute_and_save_profiles(
         num_workers=num_workers,
         id_classes=id_classes,
     )
-    profiles = compute_energy_profiles(model=model, dataloader=loader, num_classes=num_classes, device=device)
+    profiles = compute_energy_profiles(
+        model=model,
+        dataloader=loader,
+        num_classes=num_classes,
+        temperature=temperature,
+        device=device,
+    )
 
     profiles_payload = {
         "profiles": profiles,
         "num_classes": num_classes,
         "id_classes": list(id_classes),
         "id_class_names": list(class_names),
+        "temperature": temperature,
     }
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -120,7 +129,7 @@ def compute_and_save_profiles(
             for images, labels in loader:
                 images = images.to(device)
                 labels = labels.to(device)
-                logits = model(images)
+                logits = model(images) / max(temperature, 1e-6)
                 for k in range(num_classes):
                     mask = labels == k
                     if mask.any():
@@ -142,6 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=str, default=DEFAULT_CONFIG.data_root)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_CONFIG.batch_size)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_CONFIG.num_workers)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_CONFIG.temperature)
     parser.add_argument(
         "--id-classes",
         type=str,
@@ -163,6 +173,7 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         id_classes=parse_class_indices(args.id_classes),
+        temperature=args.temperature,
         plot_path=args.plot_path,
     )
 

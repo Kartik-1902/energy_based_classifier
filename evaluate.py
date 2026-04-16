@@ -99,6 +99,33 @@ def compute_fpr_at_95_tpr(y_true: np.ndarray, scores: np.ndarray) -> float:
     return 1.0
 
 
+def compute_ood_metrics(y_true: np.ndarray, scores: np.ndarray) -> Dict[str, float]:
+    """Compute AUROC and FPR@95TPR when larger score indicates more OOD-like."""
+    return {
+        "auroc": float(roc_auc_score(y_true, scores)),
+        "fpr95": float(compute_fpr_at_95_tpr(y_true, scores)),
+    }
+
+
+def odin_perturb_inputs(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    temperature: float,
+    epsilon: float,
+) -> torch.Tensor:
+    """Apply ODIN-style adversarial preprocessing used only for OOD scoring."""
+    if epsilon <= 0.0:
+        return images
+
+    x = images.detach().clone().requires_grad_(True)
+    model.zero_grad(set_to_none=True)
+    logits = model(x) / max(temperature, 1e-6)
+    preds = logits.argmax(dim=1)
+    loss = F.cross_entropy(logits, preds)
+    grad = torch.autograd.grad(loss, x, only_inputs=True)[0]
+    return (x - epsilon * torch.sign(grad)).detach()
+
+
 def collect_logits_labels(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -129,7 +156,7 @@ def optimize_temperature(logits: np.ndarray, labels: np.ndarray) -> float:
         loss = F.cross_entropy(logits_t / t, labels_t)
         return float(loss.item())
 
-    result = minimize_scalar(objective, bounds=(0.5, 5.0), method="bounded")
+    result = minimize_scalar(objective, bounds=(0.5, 10.0), method="bounded")
     return float(result.x)
 
 
@@ -147,7 +174,7 @@ def evaluate_id_metrics(
     probs = torch.softmax(logits / temperature, dim=1)
     softmax_conf, softmax_preds = probs.max(dim=1)
 
-    energy_preds, is_ood, z_scores = energy_predict(logits, profiles, tau=tau)
+    energy_preds, is_ood, z_scores = energy_predict(logits, profiles, tau=tau, temperature=temperature)
     min_z, _ = z_scores.min(dim=1)
     energy_conf = 1.0 - torch.clamp(min_z / max(tau, 1e-6), min=0.0, max=1.0)
 
@@ -198,33 +225,56 @@ def evaluate_ood(
     ood_loader: DataLoader,
     device: torch.device,
     temperature: float,
-) -> Dict[str, float | np.ndarray]:
-    """Evaluate OOD detection using marginal energy as score."""
+    odin_epsilon: float,
+) -> Dict[str, Dict[str, float | np.ndarray]]:
+    """Evaluate OOD detection for softmax baseline and energy score, with optional ODIN perturbation."""
 
-    def collect_marginal_energies(loader: DataLoader) -> np.ndarray:
-        vals = []
-        with torch.no_grad():
-            for images, _ in loader:
-                images = images.to(device)
+    def collect_scores(loader: DataLoader) -> tuple[np.ndarray, np.ndarray]:
+        softmax_scores = []
+        energy_scores = []
+
+        for images, _ in loader:
+            images = images.to(device)
+            if odin_epsilon > 0.0:
+                images = odin_perturb_inputs(
+                    model=model,
+                    images=images,
+                    temperature=temperature,
+                    epsilon=odin_epsilon,
+                )
+
+            with torch.no_grad():
                 logits = model(images)
-                e = marginal_energy(logits, temperature=temperature)
-                vals.append(e.cpu().numpy())
-        return np.concatenate(vals, axis=0)
+                scaled_logits = logits / max(temperature, 1e-6)
+                probs = torch.softmax(scaled_logits, dim=1)
+                max_conf, _ = probs.max(dim=1)
+                softmax_scores.append((1.0 - max_conf).cpu().numpy())
+                energy_scores.append(marginal_energy(logits, temperature=temperature).cpu().numpy())
 
-    id_scores = collect_marginal_energies(id_loader)
-    ood_scores = collect_marginal_energies(ood_loader)
+        return np.concatenate(softmax_scores, axis=0), np.concatenate(energy_scores, axis=0)
 
-    y_true = np.concatenate([np.zeros_like(id_scores), np.ones_like(ood_scores)])
-    y_scores = np.concatenate([id_scores, ood_scores])
+    id_softmax_scores, id_energy_scores = collect_scores(id_loader)
+    ood_softmax_scores, ood_energy_scores = collect_scores(ood_loader)
 
-    auroc = float(roc_auc_score(y_true, y_scores))
-    fpr95 = float(compute_fpr_at_95_tpr(y_true, y_scores))
+    y_true_softmax = np.concatenate([np.zeros_like(id_softmax_scores), np.ones_like(ood_softmax_scores)])
+    y_scores_softmax = np.concatenate([id_softmax_scores, ood_softmax_scores])
+    y_true_energy = np.concatenate([np.zeros_like(id_energy_scores), np.ones_like(ood_energy_scores)])
+    y_scores_energy = np.concatenate([id_energy_scores, ood_energy_scores])
+
+    softmax_metrics = compute_ood_metrics(y_true_softmax, y_scores_softmax)
+    energy_metrics = compute_ood_metrics(y_true_energy, y_scores_energy)
 
     return {
-        "auroc": auroc,
-        "fpr95": fpr95,
-        "id_scores": id_scores,
-        "ood_scores": ood_scores,
+        "softmax": {
+            **softmax_metrics,
+            "id_scores": id_softmax_scores,
+            "ood_scores": ood_softmax_scores,
+        },
+        "energy": {
+            **energy_metrics,
+            "id_scores": id_energy_scores,
+            "ood_scores": ood_energy_scores,
+        },
     }
 
 
@@ -239,6 +289,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=DEFAULT_CONFIG.num_workers)
     parser.add_argument("--tau", type=float, default=DEFAULT_CONFIG.tau)
     parser.add_argument("--temperature", type=float, default=DEFAULT_CONFIG.temperature)
+    parser.add_argument(
+        "--odin-epsilon",
+        type=float,
+        default=DEFAULT_CONFIG.odin_epsilon,
+        help="ODIN perturbation epsilon applied only during OOD scoring",
+    )
     parser.add_argument(
         "--id-classes",
         type=str,
@@ -342,6 +398,7 @@ def main() -> None:
         ood_loader=ood_loader,
         device=device,
         temperature=temperature,
+        odin_epsilon=args.odin_epsilon,
     )
 
     plot_calibration(
@@ -359,8 +416,8 @@ def main() -> None:
         title="Reliability Diagram - Energy",
     )
     plot_ood_separation(
-        ood_metrics["id_scores"],
-        ood_metrics["ood_scores"],
+        ood_metrics["energy"]["id_scores"],
+        ood_metrics["energy"]["ood_scores"],
         save_path=str(Path(args.results_dir) / "ood_energy_separation.png"),
     )
 
@@ -372,17 +429,19 @@ def main() -> None:
     print("Method          | Accuracy | ECE    | AUROC (OOD)")
     print("-" * 50)
     print(
-        f"Softmax baseline| {id_metrics['softmax_acc']:.4f}   | {id_metrics['softmax_ece']:.4f} | {ood_metrics['auroc']:.4f}"
+        f"Softmax baseline| {id_metrics['softmax_acc']:.4f}   | {id_metrics['softmax_ece']:.4f} | {ood_metrics['softmax']['auroc']:.4f}"
     )
     print(
-        f"Energy (ours)   | {id_metrics['energy_acc']:.4f}   | {id_metrics['energy_ece']:.4f} | {ood_metrics['auroc']:.4f}"
+        f"Energy (ours)   | {id_metrics['energy_acc']:.4f}   | {id_metrics['energy_ece']:.4f} | {ood_metrics['energy']['auroc']:.4f}"
     )
 
     print("\nAdditional metrics")
     print(f"OOD dataset: {args.ood_dataset}")
-    print(f"FPR@95TPR: {ood_metrics['fpr95']:.4f}")
+    print(f"Softmax FPR@95TPR: {ood_metrics['softmax']['fpr95']:.4f}")
+    print(f"Energy FPR@95TPR: {ood_metrics['energy']['fpr95']:.4f}")
     print(f"Energy rejection rate on ID: {id_metrics['rejection_rate']:.4f}")
     print(f"Using temperature: {temperature:.4f}")
+    print(f"ODIN epsilon: {args.odin_epsilon:.6f}")
     print(f"Saved plots to {args.results_dir}")
 
 

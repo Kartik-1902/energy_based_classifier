@@ -108,7 +108,7 @@ def main() -> None:
         logits = model(x)
         probs = F.softmax(logits / args.temperature, dim=1)
         softmax_conf, softmax_pred = probs.max(dim=1)
-        pred, is_ood, z_scores = energy_predict(logits, profiles, tau=args.tau)
+        pred, is_ood, z_scores = energy_predict(logits, profiles, tau=args.tau, temperature=args.temperature)
 
     min_z = z_scores[0, pred.item()].item()
     confidence = float(max(0.0, min(1.0, 1.0 - (min_z / max(args.tau, 1e-6)))))

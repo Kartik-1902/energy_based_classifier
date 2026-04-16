@@ -1,8 +1,13 @@
-# Energy-Based Classifier for CIFAR-10
+# Energy-Based Classifier for CIFAR-10 (8 ID / 2 OOD)
 
 This project implements an energy-based classifier inspired by EPOTTA and JEM.
-It trains a CNN on CIFAR-10, computes per-class energy profiles, and performs
-energy-based prediction plus OOD rejection.
+It trains a CNN on selected in-distribution CIFAR-10 classes, computes per-class
+energy profiles, and performs energy-based prediction plus OOD rejection.
+
+Current default setup:
+
+- In-distribution (ID): CIFAR-10 classes `0..7`
+- Held-out OOD: CIFAR-10 classes `8,9`
 
 ## Implemented Math
 
@@ -20,7 +25,7 @@ Given model logits `f(x)` and temperature `T`:
   E(x, y) = -f(x)_y
   \]
 
-Per-class profile for class `k` is built from all CIFAR-10 train samples with label `k`:
+Per-class profile for class `k` is built from all ID-train samples with local label `k`:
 
 - `mu_k = mean(E(x, k))`
 - `sigma_k = std(E(x, k))`
@@ -47,14 +52,15 @@ Inference rule:
 ```bash
 cd energy_based_classifier
 python -m venv .venv
-. .venv/Scripts/activate
+source .venv/bin/activate   # Linux/macOS
+# .\.venv\Scripts\activate  # Windows PowerShell
 pip install -r requirements.txt
 ```
 
-## Train
+## Train (ID Classes Only)
 
 ```bash
-python train.py --model-name resnet18 --epochs 200 --batch-size 128
+python train.py --model-name resnet18 --epochs 200 --batch-size 128 --id-classes 0,1,2,3,4,5,6,7 --ood-classes 8,9
 ```
 
 Outputs:
@@ -70,10 +76,15 @@ Training details:
 - Scheduler: cosine annealing
 - Loss: cross-entropy
 
+Notes:
+
+- The classifier output dimension is the number of ID classes.
+- With `--id-classes 0,1,2,3,4,5,6,7`, model head has 8 outputs.
+
 ## Compute Profiles Separately
 
 ```bash
-python profile_energy.py --checkpoint ./checkpoints/best_model.pth --output ./checkpoints/energy_profiles.pkl
+python profile_energy.py --checkpoint ./checkpoints/best_model.pth --output ./checkpoints/energy_profiles.pkl --id-classes 0,1,2,3,4,5,6,7
 ```
 
 This prints class-wise summary: class, `mu`, `sigma`, `min`, `max`, `count`.
@@ -83,6 +94,8 @@ This prints class-wise summary: class, `mu`, `sigma`, `min`, `max`, `count`.
 ```bash
 python inference.py path/to/image.png --checkpoint ./checkpoints/best_model.pth --profiles ./checkpoints/energy_profiles.pkl --tau 3.0 --plot
 ```
+
+Replace `path/to/image.png` with a real image file path.
 
 Example output format:
 
@@ -98,7 +111,16 @@ OOD rejected: False
 ## Evaluation
 
 ```bash
+python evaluate.py --checkpoint ./checkpoints/best_model.pth --profiles ./checkpoints/energy_profiles.pkl --id-classes 0,1,2,3,4,5,6,7 --ood-classes 8,9 --ood-dataset heldout-cifar10
+```
+
+By default, `--ood-dataset heldout-cifar10` evaluates OOD rejection using the held-out CIFAR-10 classes.
+
+Alternative OOD datasets are still available:
+
+```bash
 python evaluate.py --checkpoint ./checkpoints/best_model.pth --profiles ./checkpoints/energy_profiles.pkl --ood-dataset cifar100
+python evaluate.py --checkpoint ./checkpoints/best_model.pth --profiles ./checkpoints/energy_profiles.pkl --ood-dataset svhn
 ```
 
 Optional temperature calibration:
@@ -111,16 +133,15 @@ Reported metrics:
 
 - Softmax accuracy and ECE
 - Energy-based accuracy and ECE
-- Per-class accuracy (energy predictor)
+- Per-class accuracy (energy predictor, ID classes)
 - OOD AUROC and FPR@95TPR using marginal energy scores
 - Reliability diagrams and OOD separation plot in `results/`
 
-## Expected Targets (Typical)
+## Experiment Design
 
-- CIFAR-10 accuracy around 93-95% (ResNet-18)
-- Energy-based accuracy close to softmax
-- OOD AUROC versus CIFAR-100 often above 0.85
-- ECE improved with calibration/energy-based confidence
+- This repository is configured for OOD rejection, not novel-class discovery.
+- Held-out classes should be rejected as unknown, not assigned new class indices.
+- If you change `--id-classes`, keep `--ood-classes` disjoint and covering the remaining CIFAR-10 classes.
 
 ## Notes
 
