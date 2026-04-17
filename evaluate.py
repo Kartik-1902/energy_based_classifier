@@ -221,11 +221,14 @@ def evaluate_id_metrics(
 
 def evaluate_ood(
     model: torch.nn.Module,
+    profiles: Dict[int, Dict[str, float]],
     id_loader: DataLoader,
     ood_loader: DataLoader,
     device: torch.device,
     temperature: float,
     odin_epsilon: float,
+    tau: float,
+    energy_ood_score: str,
 ) -> Dict[str, Dict[str, float | np.ndarray]]:
     """Evaluate OOD detection for softmax baseline and energy score, with optional ODIN perturbation."""
 
@@ -249,7 +252,17 @@ def evaluate_ood(
                 probs = torch.softmax(scaled_logits, dim=1)
                 max_conf, _ = probs.max(dim=1)
                 softmax_scores.append((1.0 - max_conf).cpu().numpy())
-                energy_scores.append(marginal_energy(logits, temperature=temperature).cpu().numpy())
+                if energy_ood_score == "marginal":
+                    energy_scores.append(marginal_energy(logits, temperature=temperature).cpu().numpy())
+                else:
+                    _, _, z_scores = energy_predict(
+                        logits,
+                        profiles,
+                        tau=tau,
+                        temperature=temperature,
+                    )
+                    min_z, _ = z_scores.min(dim=1)
+                    energy_scores.append(min_z.cpu().numpy())
 
         return np.concatenate(softmax_scores, axis=0), np.concatenate(energy_scores, axis=0)
 
@@ -294,6 +307,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_CONFIG.odin_epsilon,
         help="ODIN perturbation epsilon applied only during OOD scoring",
+    )
+    parser.add_argument(
+        "--energy-ood-score",
+        type=str,
+        default="marginal",
+        choices=["marginal", "minz"],
+        help="Energy OOD score type: marginal energy or class-profile min-z distance",
     )
     parser.add_argument(
         "--id-classes",
@@ -394,11 +414,14 @@ def main() -> None:
 
     ood_metrics = evaluate_ood(
         model=model,
+        profiles=profiles,
         id_loader=id_loader_for_ood,
         ood_loader=ood_loader,
         device=device,
         temperature=temperature,
         odin_epsilon=args.odin_epsilon,
+        tau=args.tau,
+        energy_ood_score=args.energy_ood_score,
     )
 
     plot_calibration(
@@ -442,6 +465,7 @@ def main() -> None:
     print(f"Energy rejection rate on ID: {id_metrics['rejection_rate']:.4f}")
     print(f"Using temperature: {temperature:.4f}")
     print(f"ODIN epsilon: {args.odin_epsilon:.6f}")
+    print(f"Energy OOD score: {args.energy_ood_score}")
     print(f"Saved plots to {args.results_dir}")
 
 
