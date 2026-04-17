@@ -80,8 +80,10 @@ def compute_and_save_profiles(
     model_name = checkpoint.get("model_name", model_name)
     num_classes = int(checkpoint.get("num_classes", num_classes))
     id_classes = tuple(checkpoint.get("id_classes", list(id_classes)))
-    temperature = float(checkpoint.get("temperature", temperature))
     class_names = checkpoint.get("id_class_names", class_names_from_indices(id_classes))
+
+    # Keep explicit CLI temperature for profile sweeps instead of forcing checkpoint temperature.
+    temperature = float(temperature)
 
     model = build_model(model_name=model_name, num_classes=num_classes).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
