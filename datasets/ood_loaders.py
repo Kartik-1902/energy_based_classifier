@@ -104,7 +104,7 @@ class HFImageNetStream(IterableDataset):
                 "Install with: pip install -r requirements_ood.txt"
             ) from exc
 
-        stream = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=True)
+        stream = load_dataset("ILSVRC/imagenet-1k", split="validation", streaming=True, token=True)
         emitted = 0
         for item in stream:
             image = item.get("image")
